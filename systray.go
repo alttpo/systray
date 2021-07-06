@@ -28,11 +28,16 @@ func init() {
 	runtime.LockOSThread()
 }
 
+type ClickedFunc func(item *MenuItem)
+
 // MenuItem is used to keep track each menu item of systray.
 // Don't create it directly, use the one systray.AddMenuItem() returned
 type MenuItem struct {
 	// ClickedCh is the channel which will be notified when the menu item is clicked
 	ClickedCh chan struct{}
+	// ClickedFunc is the callback to invoke if not nil, otherwise ClickedCh will be
+	// sent to
+	ClickedFunc ClickedFunc
 
 	// id uniquely identify a menu item, not supposed to be modified
 	id uint32
@@ -59,8 +64,7 @@ func (item *MenuItem) String() string {
 
 // newMenuItem returns a populated MenuItem object
 func newMenuItem(title string, tooltip string, parent *MenuItem) *MenuItem {
-	return &MenuItem{
-		ClickedCh:   make(chan struct{}),
+	item := &MenuItem{
 		id:          atomic.AddUint32(&currentID, 1),
 		title:       title,
 		tooltip:     tooltip,
@@ -69,6 +73,8 @@ func newMenuItem(title string, tooltip string, parent *MenuItem) *MenuItem {
 		isCheckable: false,
 		parent:      parent,
 	}
+	item.ClickedCh = make(chan struct{})
+	return item
 }
 
 // Run initializes GUI and starts the event loop, then invokes the onReady
@@ -228,9 +234,13 @@ func systrayMenuItemSelected(id uint32) {
 		log.Errorf("No menu item with ID %v", id)
 		return
 	}
-	select {
-	case item.ClickedCh <- struct{}{}:
-	// in case no one waiting for the channel
-	default:
+	if cf := item.ClickedFunc; cf != nil {
+		cf(item)
+	} else {
+		select {
+		case item.ClickedCh <- struct{}{}:
+		// in case no one waiting for the channel
+		default:
+		}
 	}
 }
