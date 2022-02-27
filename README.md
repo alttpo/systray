@@ -68,10 +68,10 @@ The code under `webview_example` is to demostrate how it can co-exist with other
 
 ### Linux
 
-* Building apps requires gcc as well as the `gtk3` and `libappindicator3` development headers to be installed. For Debian or Ubuntu, you may install these using:
+* Building apps requires gcc as well as the `gtk3` and `libayatana-appindicator3` development headers to be installed. For Debian or Ubuntu, you may install these using:
 
 ```sh
-sudo apt-get install gcc libgtk-3-dev libappindicator3-dev
+sudo apt-get install gcc libgtk-3-dev libayatana-appindicator3-dev
 ```
 
 On Linux Mint, `libxapp-dev` is also required .
