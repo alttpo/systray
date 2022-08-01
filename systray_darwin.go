@@ -9,6 +9,8 @@ package systray
 import "C"
 
 import (
+	"fmt"
+	"os/exec"
 	"unsafe"
 )
 
@@ -35,4 +37,21 @@ func (item *MenuItem) SetIcon(iconBytes []byte) {
 func (item *MenuItem) SetTemplateIcon(templateIconBytes []byte, regularIconBytes []byte) {
 	cstr := (*C.char)(unsafe.Pointer(&templateIconBytes[0]))
 	C.setMenuItemIcon(cstr, (C.int)(len(templateIconBytes)), C.int(item.id), true)
+}
+
+// ShowMessage shows a notification on the end user's desktop
+func ShowMessage(appName, title, msg string) {
+	osa, err := exec.LookPath("osascript")
+	if err != nil {
+		log.Errorf("Unable to locate osascript executable: %v", err)
+		return
+	}
+
+	script := fmt.Sprintf("display notification %q with title %q", msg, title)
+	cmd := exec.Command(osa, "-e", script)
+	err = cmd.Run()
+	if err != nil {
+		log.Errorf("Unable to send desktop notification: %v", err)
+		return
+	}
 }

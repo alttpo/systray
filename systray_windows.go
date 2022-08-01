@@ -1,3 +1,4 @@
+//go:build windows
 // +build windows
 
 package systray
@@ -111,7 +112,7 @@ type notifyIconData struct {
 	Tip                        [128]uint16
 	State, StateMask           uint32
 	Info                       [256]uint16
-	Timeout, Version           uint32
+	TimeoutOrVersion           uint32
 	InfoTitle                  [64]uint16
 	InfoFlags                  uint32
 	GuidItem                   windows.GUID
@@ -146,6 +147,18 @@ func (nid *notifyIconData) delete() error {
 	const NIM_DELETE = 0x00000002
 	res, _, err := pShellNotifyIcon.Call(
 		uintptr(NIM_DELETE),
+		uintptr(unsafe.Pointer(nid)),
+	)
+	if res == 0 {
+		return err
+	}
+	return nil
+}
+
+func (nid *notifyIconData) setVersion() error {
+	const NIM_SETVERSION = 0x00000004
+	res, _, err := pShellNotifyIcon.Call(
+		uintptr(NIM_SETVERSION),
 		uintptr(unsafe.Pointer(nid)),
 	)
 	if res == 0 {
@@ -241,6 +254,38 @@ func (t *winTray) setTooltip(src string) error {
 	return t.nid.modify()
 }
 
+func (t *winTray) showMessage(title, msg string) error {
+	const NIF_INFO = 0x00000010
+	const NIIF_ERROR = 0x00000003
+
+	var err error
+	var btitle []uint16
+	var bmsg []uint16
+
+	btitle, err = windows.UTF16FromString(title)
+	if err != nil {
+		return err
+	}
+
+	bmsg, err = windows.UTF16FromString(msg)
+	if err != nil {
+		return err
+	}
+
+	t.muNID.Lock()
+	defer t.muNID.Unlock()
+
+	t.nid.Flags |= NIF_INFO
+	t.nid.InfoFlags = NIIF_ERROR
+
+	copy(t.nid.InfoTitle[:], btitle)
+	copy(t.nid.Info[:], bmsg)
+
+	err = t.nid.modify()
+
+	return err
+}
+
 var wt winTray
 
 // WindowProc callback function that processes messages sent to a window.
@@ -320,6 +365,7 @@ func (t *winTray) initInstance() error {
 		CS_VREDRAW = 0x0001
 	)
 	const NIF_MESSAGE = 0x00000001
+	const NOTIFYICON_VERSION_4 = 4
 
 	// https://msdn.microsoft.com/en-us/library/windows/desktop/ms644931(v=vs.85).aspx
 	const WM_USER = 0x0400
@@ -419,14 +465,25 @@ func (t *winTray) initInstance() error {
 	t.muNID.Lock()
 	defer t.muNID.Unlock()
 	t.nid = &notifyIconData{
-		Wnd:             windows.Handle(t.window),
-		ID:              100,
-		Flags:           NIF_MESSAGE,
-		CallbackMessage: t.wmSystrayMessage,
+		Wnd:              windows.Handle(t.window),
+		ID:               100,
+		Flags:            NIF_MESSAGE,
+		TimeoutOrVersion: NOTIFYICON_VERSION_4,
+		CallbackMessage:  t.wmSystrayMessage,
 	}
 	t.nid.Size = uint32(unsafe.Sizeof(*t.nid))
 
-	return t.nid.add()
+	err = t.nid.add()
+	if err != nil {
+		return err
+	}
+
+	err = t.nid.setVersion()
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (t *winTray) createMenu() error {
@@ -941,4 +998,14 @@ func hideMenuItem(item *MenuItem) {
 
 func showMenuItem(item *MenuItem) {
 	addOrUpdateMenuItem(item)
+}
+
+// ShowMessage shows a notification on the end user's desktop
+func ShowMessage(appName, title, msg string) {
+	_ = appName
+	err := wt.showMessage(title, msg)
+	if err != nil {
+		log.Errorf("Unable to show message: %v", err)
+		return
+	}
 }
