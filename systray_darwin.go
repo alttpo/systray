@@ -47,7 +47,7 @@ func ShowMessage(appName, title, msg string) {
 		return
 	}
 
-	script := fmt.Sprintf("display notification %q with title %q", msg, title)
+	script := fmt.Sprintf("display notification %q with title %q subtitle %q", msg, appName, title)
 	cmd := exec.Command(osa, "-e", script)
 	err = cmd.Run()
 	if err != nil {

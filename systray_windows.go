@@ -255,8 +255,13 @@ func (t *winTray) setTooltip(src string) error {
 }
 
 func (t *winTray) showMessage(title, msg string) error {
+	const NIF_STATE = 0x00000008
 	const NIF_INFO = 0x00000010
+	const NIS_SHAREDICON = 0x00000002
+	const NIIF_NONE = 0x00000000
 	const NIIF_ERROR = 0x00000003
+	const NIIF_USER = 0x00000004
+	const NIIF_LARGE_ICON = 0x00000020
 
 	var err error
 	var btitle []uint16
@@ -275,12 +280,17 @@ func (t *winTray) showMessage(title, msg string) error {
 	t.muNID.Lock()
 	defer t.muNID.Unlock()
 
-	t.nid.Flags |= NIF_INFO
-	t.nid.InfoFlags = NIIF_ERROR
+	t.nid.Flags |= NIF_INFO | NIF_STATE
+	t.nid.InfoFlags = NIIF_USER | NIIF_LARGE_ICON
+	t.nid.State = NIS_SHAREDICON
+	t.nid.StateMask = NIS_SHAREDICON
+	t.nid.BalloonIcon = t.nid.Icon
 
 	copy(t.nid.InfoTitle[:], btitle)
 	copy(t.nid.Info[:], bmsg)
 
+	// on Windows 10, File Description field from resource shows at the top of the balloon notification, else the
+	// executable filename.
 	err = t.nid.modify()
 
 	return err
@@ -478,10 +488,10 @@ func (t *winTray) initInstance() error {
 		return err
 	}
 
-	err = t.nid.setVersion()
-	if err != nil {
-		return err
-	}
+	//err = t.nid.setVersion()
+	//if err != nil {
+	//	return err
+	//}
 
 	return nil
 }
