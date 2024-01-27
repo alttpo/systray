@@ -225,7 +225,24 @@ NSMenuItem *find_menu_item(NSMenu *ourMenu, NSNumber *menuId) {
 
 @end
 
+@interface DummyClass : NSObject
+- (void)dummyMethod;
+@end
+
+@implementation DummyClass
+- (void)dummyMethod {
+}
+@end
+
 void registerSystray(void) {
+  // NOTE(jsd): workaround to make Cocoa multithread-aware:
+  DummyClass *myDummyObject = [[DummyClass alloc] init];
+  [NSThread detachNewThreadSelector:@selector(dummyMethod)
+    toTarget:myDummyObject
+    withObject:nil
+  ];
+  //printf("isMultiThreaded: %d\n", [NSThread isMultiThreaded]);
+
   AppDelegate *delegate = [[AppDelegate alloc] init];
   [[NSApplication sharedApplication] setDelegate:delegate];
   // A workaround to avoid crashing on macOS versions before Catalina. Somehow
