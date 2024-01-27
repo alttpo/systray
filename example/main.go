@@ -5,8 +5,8 @@ import (
 	"io/ioutil"
 	"time"
 
-	"github.com/getlantern/systray"
-	"github.com/getlantern/systray/example/icon"
+	"github.com/alttpo/systray"
+	"github.com/alttpo/systray/example/icon"
 	"github.com/skratchdot/open-golang/open"
 )
 
