@@ -1,10 +1,12 @@
+# systray
+
 systray is a cross-platform Go library to place an icon and menu in the notification area.
 
 ## Features
 
 * Supported on Windows, macOS, and Linux
 * Menu items can be checked and/or disabled
-* Methods may be called from any Goroutine
+* Most functions may be called from any goroutine
 
 ## API
 
@@ -28,7 +30,7 @@ func onExit() {
 }
 ```
 
-See [full API](https://pkg.go.dev/github.com/getlantern/systray?tab=doc) as well as [CHANGELOG](https://github.com/getlantern/systray/tree/master/CHANGELOG.md).
+See [![full API](https://pkg.go.dev/badge/github.com/getlantern/systray.svg)](https://pkg.go.dev/github.com/getlantern/systray) as well as [CHANGELOG](https://github.com/getlantern/systray/tree/master/CHANGELOG.md).
 
 Note: this package requires cgo, so make sure you set `CGO_ENABLED=1` before building.
 
@@ -38,7 +40,7 @@ Have go v1.12+ or higher installed? Here's an example to get started on macOS:
 
 ```sh
 git clone https://github.com/getlantern/systray
-cd example
+cd systray/example
 env GO111MODULE=on go build
 ./example
 ```
@@ -47,15 +49,6 @@ On Windows, you should build like this:
 
 ```
 env GO111MODULE=on go build -ldflags "-H=windowsgui"
-```
-
-The following text will then appear on the console:
-
-
-```sh
-go: finding github.com/skratchdot/open-golang latest
-go: finding github.com/getlantern/systray latest
-go: finding github.com/getlantern/golog latest
 ```
 
 Now look for *Awesome App* in your menu bar!
@@ -122,6 +115,11 @@ When running as an app bundle, you may want to add one or both of the following 
 ```
 
 Consult the [Official Apple Documentation here](https://developer.apple.com/library/archive/documentation/CoreFoundation/Conceptual/CFBundles/BundleTypes/BundleTypes.html#//apple_ref/doc/uid/10000123i-CH101-SW1).
+
+On macOS, it's possible to set the underlying
+[`NSStatusItemBehavior`](https://developer.apple.com/documentation/appkit/nsstatusitembehavior?language=objc)
+with `systray.SetRemovalAllowed(true)`. When enabled, the user can cmd-drag the
+icon off the menu bar.
 
 ## Credits
 
