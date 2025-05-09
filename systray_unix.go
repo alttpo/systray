@@ -150,6 +150,39 @@ func (item *MenuItem) SetTemplateIcon(templateIconBytes []byte, regularIconBytes
 func SetRemovalAllowed(allowed bool) {
 }
 
+// ShowMessage shows a notification on the end user's desktop
+func ShowMessage(appName, title, msg string) {
+	conn, err := dbus.SessionBus()
+	if err != nil {
+		log.Printf("systray error: unable to obtain dbus session: %v\n", err)
+		return
+	}
+
+	obj := conn.Object(
+		"org.freedesktop.Notifications",
+		dbus.ObjectPath("/org/freedesktop/Notifications"),
+	)
+
+	call := obj.Call(
+		"org.freedesktop.Notifications.Notify",
+		0,
+		appName,
+		uint32(0),                 // replaces_id
+		"",                        // app_icon
+		title,                     // summary
+		msg,                       // body
+		[]string{},                // actions
+		map[string]dbus.Variant{}, // hints
+		int32(-1),                 // expire_timeout (msec)
+	)
+	if call.Err != nil {
+		log.Printf("systray error: unable to send desktop notification: %v\n", call.Err)
+		return
+	}
+
+	return
+}
+
 func setInternalLoop(_ bool) {
 	// nothing to action on Linux
 }
