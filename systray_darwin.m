@@ -1,3 +1,5 @@
+//go:build !ios
+
 #import <Cocoa/Cocoa.h>
 #include "systray.h"
 
@@ -50,13 +52,14 @@ withParentMenuId: (int)theParentMenuId
 }
 @end
 
-@interface AppDelegate: NSObject <NSApplicationDelegate>
+@interface SystrayAppDelegate: NSObject <NSApplicationDelegate, NSMenuDelegate>
   - (void) add_or_update_menu_item:(MenuItem*) item;
   - (IBAction)menuHandler:(id)sender;
+  - (void)menuWillOpen:(NSMenu*)menu;
   @property (assign) IBOutlet NSWindow *window;
   @end
 
-  @implementation AppDelegate
+  @implementation SystrayAppDelegate
 {
   NSStatusItem *statusItem;
   NSMenu *menu;
@@ -68,13 +71,15 @@ withParentMenuId: (int)theParentMenuId
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification
 {
   self->statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
+
   self->menu = [[NSMenu alloc] init];
-  [self->menu setAutoenablesItems: FALSE];
-  [self->statusItem setMenu:self->menu];
+  self->menu.delegate = self;
+  self->menu.autoenablesItems = FALSE;
+  self->statusItem.menu = self->menu;
   // Once the user has removed it, the item needs to be explicitly brought back,
   // even restarting the application is insufficient.
-  // Since the interface from Go is relatively simple, for now we ensure it's always
-  // visible at application startup.
+  // Since the interface from Go is relatively simple, for now we ensure it's
+  // always visible at application startup.
   self->statusItem.visible = TRUE;
   systray_ready();
 }
@@ -84,13 +89,18 @@ withParentMenuId: (int)theParentMenuId
   systray_on_exit();
 }
 
-- (void)setRemovalAllowed:(BOOL)allowed {
+- (void)setRemovalAllowed {
   NSStatusItemBehavior behavior = [self->statusItem behavior];
-  if (allowed) {
-    behavior |= NSStatusItemBehaviorRemovalAllowed;
-  } else {
-    behavior &= ~NSStatusItemBehaviorRemovalAllowed;
-  }
+  behavior |= NSStatusItemBehaviorRemovalAllowed;
+  self->statusItem.behavior = behavior;
+}
+
+- (void)setRemovalForbidden {
+  NSStatusItemBehavior behavior = [self->statusItem behavior];
+  behavior &= ~NSStatusItemBehaviorRemovalAllowed;
+  // Ensure the menu item is visible if it was removed, since we're now
+  // disallowing removal.
+  self->statusItem.visible = TRUE;
   self->statusItem.behavior = behavior;
 }
 
@@ -104,7 +114,7 @@ withParentMenuId: (int)theParentMenuId
   [self updateTitleButtonStyle];
 }
 
--(void)updateTitleButtonStyle {
+- (void)updateTitleButtonStyle {
   if (statusItem.button.image != nil) {
     if ([statusItem.button.title length] == 0) {
       statusItem.button.imagePosition = NSImageOnly;
@@ -127,6 +137,10 @@ withParentMenuId: (int)theParentMenuId
   systray_menu_item_selected(menuId.intValue);
 }
 
+- (void)menuWillOpen:(NSMenu *)menu {
+  systray_menu_will_open();
+}
+
 - (void)add_or_update_menu_item:(MenuItem *)item {
   NSMenu *theMenu = self->menu;
   NSMenuItem *parentItem;
@@ -140,9 +154,8 @@ withParentMenuId: (int)theParentMenuId
       [parentItem setSubmenu:theMenu];
     }
   }
-  
-  NSMenuItem *menuItem;
-  menuItem = find_menu_item(theMenu, item->menuId);
+
+  NSMenuItem *menuItem = find_menu_item(theMenu, item->menuId);
   if (menuItem == NULL) {
     menuItem = [theMenu addItemWithTitle:item->title
                                action:@selector(menuHandler:)
@@ -185,8 +198,15 @@ NSMenuItem *find_menu_item(NSMenu *ourMenu, NSNumber *menuId) {
   return NULL;
 };
 
-- (void) add_separator:(NSNumber*) menuId
+- (void) add_separator:(NSNumber*) parentMenuId
 {
+  if (parentMenuId.integerValue != 0) {
+    NSMenuItem* menuItem = find_menu_item(menu, parentMenuId);
+    if (menuItem != NULL) {
+      [menuItem.submenu addItem: [NSMenuItem separatorItem]];
+      return;
+    }
+  }
   [menu addItem: [NSMenuItem separatorItem]];
 }
 
@@ -218,39 +238,65 @@ NSMenuItem *find_menu_item(NSMenu *ourMenu, NSNumber *menuId) {
   }
 }
 
+- (void) remove_menu_item:(NSNumber*) menuId
+{
+  NSMenuItem* menuItem = find_menu_item(menu, menuId);
+  if (menuItem != NULL) {
+    [menuItem.menu removeItem:menuItem];
+  }
+}
+
+- (void) reset_menu
+{
+  [self->menu removeAllItems];
+}
+
 - (void) quit
 {
-  [NSApp terminate:self];
+  // This tells the app event loop to stop after processing remaining messages.
+  [NSApp stop:self];
+  // The event loop won't return until it processes another event.
+  // https://stackoverflow.com/a/48064752/149482
+  NSPoint eventLocation = NSMakePoint(0, 0);
+  NSEvent *customEvent = [NSEvent otherEventWithType:NSEventTypeApplicationDefined
+                                            location:eventLocation
+                                       modifierFlags:0
+                                           timestamp:0
+                                        windowNumber:0
+                                             context:nil
+                                             subtype:0
+                                               data1:0
+                                               data2:0];
+  [NSApp postEvent:customEvent atStart:NO];
 }
 
 @end
 
-@interface DummyClass : NSObject
-- (void)dummyMethod;
-@end
+bool internalLoop = false;
+SystrayAppDelegate *owner;
 
-@implementation DummyClass
-- (void)dummyMethod {
+void setInternalLoop(bool i) {
+	internalLoop = i;
 }
-@end
 
 void registerSystray(void) {
-  // NOTE(jsd): workaround to make Cocoa multithread-aware:
-  DummyClass *myDummyObject = [[DummyClass alloc] init];
-  [NSThread detachNewThreadSelector:@selector(dummyMethod)
-    toTarget:myDummyObject
-    withObject:nil
-  ];
-  //printf("isMultiThreaded: %d\n", [NSThread isMultiThreaded]);
+  if (!internalLoop) { // with an external loop we don't take ownership of the app
+    return;
+  }
 
-  AppDelegate *delegate = [[AppDelegate alloc] init];
-  [[NSApplication sharedApplication] setDelegate:delegate];
+  owner = [[SystrayAppDelegate alloc] init];
+  [[NSApplication sharedApplication] setDelegate:owner];
+
   // A workaround to avoid crashing on macOS versions before Catalina. Somehow
   // SIGSEGV would happen inside AppKit if [NSApp run] is called from a
   // different function, even if that function is called right after this.
   if (floor(NSAppKitVersionNumber) <= /*NSAppKitVersionNumber10_14*/ 1671){
     [NSApp run];
   }
+}
+
+void nativeEnd(void) {
+  systray_on_exit();
 }
 
 int nativeLoop(void) {
@@ -260,8 +306,16 @@ int nativeLoop(void) {
   return EXIT_SUCCESS;
 }
 
+void nativeStart(void) {
+  owner = [[SystrayAppDelegate alloc] init];
+
+  NSNotification *launched = [NSNotification notificationWithName:NSApplicationDidFinishLaunchingNotification
+                                                        object:[NSApplication sharedApplication]];
+  [owner applicationDidFinishLaunching:launched];
+}
+
 void runInMainThread(SEL method, id object) {
-  [(AppDelegate*)[NSApp delegate]
+  [owner
     performSelectorOnMainThread:method
                      withObject:object
                   waitUntilDone: YES];
@@ -269,19 +323,23 @@ void runInMainThread(SEL method, id object) {
 
 void setIcon(const char* iconBytes, int length, bool template) {
   NSData* buffer = [NSData dataWithBytes: iconBytes length:length];
-  NSImage *image = [[NSImage alloc] initWithData:buffer];
-  [image setSize:NSMakeSize(24, 24)];
-  image.template = template;
-  runInMainThread(@selector(setIcon:), (id)image);
+  @autoreleasepool {
+    NSImage *image = [[NSImage alloc] initWithData:buffer];
+    [image setSize:NSMakeSize(16, 16)];
+    image.template = template;
+    runInMainThread(@selector(setIcon:), (id)image);
+  }
 }
 
 void setMenuItemIcon(const char* iconBytes, int length, int menuId, bool template) {
   NSData* buffer = [NSData dataWithBytes: iconBytes length:length];
-  NSImage *image = [[NSImage alloc] initWithData:buffer];
-  [image setSize:NSMakeSize(24, 24)];
-  image.template = template;
-  NSNumber *mId = [NSNumber numberWithInt:menuId];
-  runInMainThread(@selector(setMenuItemIcon:), @[image, (id)mId]);
+  @autoreleasepool {
+    NSImage *image = [[NSImage alloc] initWithData:buffer];
+    [image setSize:NSMakeSize(16, 16)];
+    image.template = template;
+    NSNumber *mId = [NSNumber numberWithInt:menuId];
+    runInMainThread(@selector(setMenuItemIcon:), @[image, (id)mId]);
+  }
 }
 
 void setTitle(char* ctitle) {
@@ -299,9 +357,11 @@ void setTooltip(char* ctooltip) {
 }
 
 void setRemovalAllowed(bool allowed) {
-  // must use an object wrapper for the bool, to use with performSelectorOnMainThread:
-  NSNumber *allow = [NSNumber numberWithBool:(BOOL)allowed];
-  runInMainThread(@selector(setRemovalAllowed:), (id)allow);
+  if (allowed) {
+    runInMainThread(@selector(setRemovalAllowed), nil);
+  } else {
+    runInMainThread(@selector(setRemovalForbidden), nil);
+  }
 }
 
 void add_or_update_menu_item(int menuId, int parentMenuId, char* title, char* tooltip, short disabled, short checked, short isCheckable) {
@@ -311,9 +371,9 @@ void add_or_update_menu_item(int menuId, int parentMenuId, char* title, char* to
   runInMainThread(@selector(add_or_update_menu_item:), (id)item);
 }
 
-void add_separator(int menuId) {
-  NSNumber *mId = [NSNumber numberWithInt:menuId];
-  runInMainThread(@selector(add_separator:), (id)mId);
+void add_separator(int menuId, int parentId) {
+  NSNumber *pId = [NSNumber numberWithInt:parentId];
+  runInMainThread(@selector(add_separator:), (id)pId);
 }
 
 void hide_menu_item(int menuId) {
@@ -321,9 +381,18 @@ void hide_menu_item(int menuId) {
   runInMainThread(@selector(hide_menu_item:), (id)mId);
 }
 
+void remove_menu_item(int menuId) {
+  NSNumber *mId = [NSNumber numberWithInt:menuId];
+  runInMainThread(@selector(remove_menu_item:), (id)mId);
+}
+
 void show_menu_item(int menuId) {
   NSNumber *mId = [NSNumber numberWithInt:menuId];
   runInMainThread(@selector(show_menu_item:), (id)mId);
+}
+
+void reset_menu() {
+  runInMainThread(@selector(reset_menu), nil);
 }
 
 void quit() {

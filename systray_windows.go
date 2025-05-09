@@ -1,16 +1,19 @@
 //go:build windows
-// +build windows
 
 package systray
 
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 
@@ -23,6 +26,7 @@ var (
 	g32                     = windows.NewLazySystemDLL("Gdi32.dll")
 	pCreateCompatibleBitmap = g32.NewProc("CreateCompatibleBitmap")
 	pCreateCompatibleDC     = g32.NewProc("CreateCompatibleDC")
+	pCreateDIBSection       = g32.NewProc("CreateDIBSection")
 	pDeleteDC               = g32.NewProc("DeleteDC")
 	pSelectObject           = g32.NewProc("SelectObject")
 
@@ -37,6 +41,8 @@ var (
 	pCreatePopupMenu       = u32.NewProc("CreatePopupMenu")
 	pCreateWindowEx        = u32.NewProc("CreateWindowExW")
 	pDefWindowProc         = u32.NewProc("DefWindowProcW")
+	pDeleteMenu            = u32.NewProc("DeleteMenu")
+	pDestroyMenu           = u32.NewProc("DestroyMenu")
 	pRemoveMenu            = u32.NewProc("RemoveMenu")
 	pDestroyWindow         = u32.NewProc("DestroyWindow")
 	pDispatchMessage       = u32.NewProc("DispatchMessageW")
@@ -62,6 +68,9 @@ var (
 	pTranslateMessage      = u32.NewProc("TranslateMessage")
 	pUnregisterClass       = u32.NewProc("UnregisterClassW")
 	pUpdateWindow          = u32.NewProc("UpdateWindow")
+
+	// ErrTrayNotReadyYet is returned by functions when they are called before the tray has been initialized.
+	ErrTrayNotReadyYet = errors.New("tray not ready yet")
 )
 
 // Contains window class information.
@@ -112,7 +121,7 @@ type notifyIconData struct {
 	Tip                        [128]uint16
 	State, StateMask           uint32
 	Info                       [256]uint16
-	TimeoutOrVersion           uint32
+	Timeout, Version           uint32
 	InfoTitle                  [64]uint16
 	InfoFlags                  uint32
 	GuidItem                   windows.GUID
@@ -185,6 +194,30 @@ type point struct {
 	X, Y int32
 }
 
+// The BITMAPINFO structure defines the dimensions and color information for a DIB.
+// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-bitmapinfo
+type bitmapInfo struct {
+	BmiHeader bitmapInfoHeader
+	BmiColors windows.Handle
+}
+
+// The BITMAPINFOHEADER structure contains information about the dimensions and color format of a device-independent bitmap (DIB).
+// https://learn.microsoft.com/en-us/previous-versions/dd183376(v=vs.85)
+// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-bitmapinfoheader
+type bitmapInfoHeader struct {
+	BiSize          uint32
+	BiWidth         int32
+	BiHeight        int32
+	BiPlanes        uint16
+	BiBitCount      uint16
+	BiCompression   uint32
+	BiSizeImage     uint32
+	BiXPelsPerMeter int32
+	BiYPelsPerMeter int32
+	BiClrUsed       uint32
+	BiClrImportant  uint32
+}
+
 // Contains information about loaded resources
 type winTray struct {
 	instance,
@@ -215,11 +248,22 @@ type winTray struct {
 
 	wmSystrayMessage,
 	wmTaskbarCreated uint32
+
+	initialized atomic.Bool
+}
+
+// isReady checks if the tray as already been initialized. It is not goroutine safe with in regard to the initialization function, but prevents a panic when functions are called too early.
+func (t *winTray) isReady() bool {
+	return t.initialized.Load()
 }
 
 // Loads an image from file and shows it in tray.
 // Shell_NotifyIcon: https://msdn.microsoft.com/en-us/library/windows/desktop/bb762159(v=vs.85).aspx
 func (t *winTray) setIcon(src string) error {
+	if !wt.isReady() {
+		return ErrTrayNotReadyYet
+	}
+
 	const NIF_ICON = 0x00000002
 
 	h, err := t.loadIconFrom(src)
@@ -239,6 +283,10 @@ func (t *winTray) setIcon(src string) error {
 // Sets tooltip on icon.
 // Shell_NotifyIcon: https://msdn.microsoft.com/en-us/library/windows/desktop/bb762159(v=vs.85).aspx
 func (t *winTray) setTooltip(src string) error {
+	if !wt.isReady() {
+		return ErrTrayNotReadyYet
+	}
+
 	const NIF_TIP = 0x00000004
 	b, err := windows.UTF16FromString(src)
 	if err != nil {
@@ -296,7 +344,7 @@ func (t *winTray) showMessage(title, msg string) error {
 	return err
 }
 
-var wt winTray
+var wt = winTray{}
 
 // WindowProc callback function that processes messages sent to a window.
 // https://msdn.microsoft.com/en-us/library/windows/desktop/ms633573(v=vs.85).aspx
@@ -329,10 +377,15 @@ func (t *winTray) wndProc(hWnd windows.Handle, message uint32, wParam, lParam ui
 			t.nid.delete()
 		}
 		t.muNID.Unlock()
-		systrayExit()
+		runSystrayExit()
 	case t.wmSystrayMessage:
 		switch lParam {
 		case WM_RBUTTONUP, WM_LBUTTONUP:
+			select {
+			case TrayOpenedCh <- struct{}{}:
+			default:
+			}
+
 			t.showMenu()
 		}
 	case t.wmTaskbarCreated: // on explorer.exe restarts
@@ -475,25 +528,15 @@ func (t *winTray) initInstance() error {
 	t.muNID.Lock()
 	defer t.muNID.Unlock()
 	t.nid = &notifyIconData{
-		Wnd:              windows.Handle(t.window),
-		ID:               100,
-		Flags:            NIF_MESSAGE,
-		TimeoutOrVersion: NOTIFYICON_VERSION_4,
-		CallbackMessage:  t.wmSystrayMessage,
+		Wnd:             windows.Handle(t.window),
+		ID:              100,
+		Flags:           NIF_MESSAGE,
+		Version:         NOTIFYICON_VERSION_4,
+		CallbackMessage: t.wmSystrayMessage,
 	}
 	t.nid.Size = uint32(unsafe.Sizeof(*t.nid))
 
-	err = t.nid.add()
-	if err != nil {
-		return err
-	}
-
-	//err = t.nid.setVersion()
-	//if err != nil {
-	//	return err
-	//}
-
-	return nil
+	return t.nid.add()
 }
 
 func (t *winTray) createMenu() error {
@@ -555,7 +598,16 @@ func (t *winTray) convertToSubMenu(menuItemId uint32) (windows.Handle, error) {
 	return menu, nil
 }
 
+// SetRemovalAllowed sets whether a user can remove the systray icon or not.
+// This is only supported on macOS.
+func SetRemovalAllowed(allowed bool) {
+}
+
 func (t *winTray) addOrUpdateMenuItem(menuItemId uint32, parentId uint32, title string, disabled, checked bool) error {
+	if !wt.isReady() {
+		return ErrTrayNotReadyYet
+	}
+
 	// https://msdn.microsoft.com/en-us/library/windows/desktop/ms647578(v=vs.85).aspx
 	const (
 		MIIM_FTYPE   = 0x00000100
@@ -649,6 +701,10 @@ func (t *winTray) addOrUpdateMenuItem(menuItemId uint32, parentId uint32, title 
 }
 
 func (t *winTray) addSeparatorMenuItem(menuItemId, parentId uint32) error {
+	if !wt.isReady() {
+		return ErrTrayNotReadyYet
+	}
+
 	// https://msdn.microsoft.com/en-us/library/windows/desktop/ms647578(v=vs.85).aspx
 	const (
 		MIIM_FTYPE = 0x00000100
@@ -683,8 +739,35 @@ func (t *winTray) addSeparatorMenuItem(menuItemId, parentId uint32) error {
 	return nil
 }
 
+func (t *winTray) removeMenuItem(menuItemId, parentId uint32) error {
+	if !wt.isReady() {
+		return ErrTrayNotReadyYet
+	}
+
+	const MF_BYCOMMAND = 0x00000000
+	const ERROR_SUCCESS syscall.Errno = 0
+
+	t.muMenus.RLock()
+	menu := uintptr(t.menus[parentId])
+	t.muMenus.RUnlock()
+	res, _, err := pDeleteMenu.Call(
+		menu,
+		uintptr(menuItemId),
+		MF_BYCOMMAND,
+	)
+	if res == 0 && err.(syscall.Errno) != ERROR_SUCCESS {
+		return err
+	}
+	t.delFromVisibleItems(parentId, menuItemId)
+
+	return nil
+}
+
 func (t *winTray) hideMenuItem(menuItemId, parentId uint32) error {
-	// https://docs.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-removemenu
+	if !wt.isReady() {
+		return ErrTrayNotReadyYet
+	}
+
 	const MF_BYCOMMAND = 0x00000000
 	const ERROR_SUCCESS syscall.Errno = 0
 
@@ -705,6 +788,10 @@ func (t *winTray) hideMenuItem(menuItemId, parentId uint32) error {
 }
 
 func (t *winTray) showMenu() error {
+	if !wt.isReady() {
+		return ErrTrayNotReadyYet
+	}
+
 	const (
 		TPM_BOTTOMALIGN = 0x0020
 		TPM_LEFTALIGN   = 0x0000
@@ -770,6 +857,10 @@ func (t *winTray) getVisibleItemIndex(parent, val uint32) int {
 // Loads an image from file to be shown in tray or menu item.
 // LoadImage: https://msdn.microsoft.com/en-us/library/windows/desktop/ms648045(v=vs.85).aspx
 func (t *winTray) loadIconFrom(src string) (windows.Handle, error) {
+	if !wt.isReady() {
+		return 0, ErrTrayNotReadyYet
+	}
+
 	const IMAGE_ICON = 1               // Loads an icon
 	const LR_LOADFROMFILE = 0x00000010 // Loads the stand-alone image from the file
 	const LR_DEFAULTSIZE = 0x00000040  // Loads default-size icon for windows(SM_CXICON x SM_CYICON) if cx, cy are set to zero
@@ -802,7 +893,7 @@ func (t *winTray) loadIconFrom(src string) (windows.Handle, error) {
 	return h, nil
 }
 
-func (t *winTray) iconToBitmap(hIcon windows.Handle) (windows.Handle, error) {
+func iconToBitmap(hIcon windows.Handle) (windows.Handle, error) {
 	const SM_CXSMICON = 49
 	const SM_CYSMICON = 50
 	const DI_NORMAL = 0x3
@@ -818,10 +909,7 @@ func (t *winTray) iconToBitmap(hIcon windows.Handle) (windows.Handle, error) {
 	defer pDeleteDC.Call(hMemDC)
 	cx, _, _ := pGetSystemMetrics.Call(SM_CXSMICON)
 	cy, _, _ := pGetSystemMetrics.Call(SM_CYSMICON)
-	hMemBmp, _, err := pCreateCompatibleBitmap.Call(hDC, cx, cy)
-	if hMemBmp == 0 {
-		return 0, err
-	}
+	hMemBmp, err := create32BitHBitmap(hMemDC, int32(cx), int32(cy))
 	hOriginalBmp, _, _ := pSelectObject.Call(hMemDC, hMemBmp)
 	defer pSelectObject.Call(hMemDC, hOriginalBmp)
 	res, _, err := pDrawIconEx.Call(hMemDC, 0, 0, uintptr(hIcon), cx, cy, 0, uintptr(0), DI_NORMAL)
@@ -831,48 +919,92 @@ func (t *winTray) iconToBitmap(hIcon windows.Handle) (windows.Handle, error) {
 	return windows.Handle(hMemBmp), nil
 }
 
+// https://learn.microsoft.com/en-us/windows/win32/api/wingdi/nf-wingdi-createdibsection
+func create32BitHBitmap(hDC uintptr, cx, cy int32) (uintptr, error) {
+	const BI_RGB uint32 = 0
+	const DIB_RGB_COLORS = 0
+	bmi := bitmapInfo{
+		BmiHeader: bitmapInfoHeader{
+			BiPlanes:      1,
+			BiCompression: BI_RGB,
+			BiWidth:       cx,
+			BiHeight:      cy,
+			BiBitCount:    32,
+		},
+	}
+	bmi.BmiHeader.BiSize = uint32(unsafe.Sizeof(bmi.BmiHeader))
+	var bits uintptr
+	hBitmap, _, err := pCreateDIBSection.Call(
+		hDC,
+		uintptr(unsafe.Pointer(&bmi)),
+		DIB_RGB_COLORS,
+		uintptr(unsafe.Pointer(&bits)),
+		uintptr(0),
+		0,
+	)
+	if hBitmap == 0 {
+		return 0, err
+	}
+	return hBitmap, nil
+}
+
 func registerSystray() {
 	if err := wt.initInstance(); err != nil {
-		log.Errorf("Unable to init instance: %v", err)
+		log.Printf("systray error: unable to init instance: %s\n", err)
 		return
 	}
 
 	if err := wt.createMenu(); err != nil {
-		log.Errorf("Unable to create menu: %v", err)
+		log.Printf("systray error: unable to create menu: %s\n", err)
 		return
 	}
 
+	wt.initialized.Store(true)
 	systrayReady()
 }
 
-func nativeLoop() {
-	// Main message pump.
-	m := &struct {
-		WindowHandle windows.Handle
-		Message      uint32
-		Wparam       uintptr
-		Lparam       uintptr
-		Time         uint32
-		Pt           point
-	}{}
-	for {
-		ret, _, err := pGetMessage.Call(uintptr(unsafe.Pointer(m)), 0, 0, 0)
+var m = &struct {
+	WindowHandle windows.Handle
+	Message      uint32
+	Wparam       uintptr
+	Lparam       uintptr
+	Time         uint32
+	Pt           point
+}{}
 
-		// If the function retrieves a message other than WM_QUIT, the return value is nonzero.
-		// If the function retrieves the WM_QUIT message, the return value is zero.
-		// If there is an error, the return value is -1
-		// https://msdn.microsoft.com/en-us/library/windows/desktop/ms644936(v=vs.85).aspx
-		switch int32(ret) {
-		case -1:
-			log.Errorf("Error at message loop: %v", err)
-			return
-		case 0:
-			return
-		default:
-			pTranslateMessage.Call(uintptr(unsafe.Pointer(m)))
-			pDispatchMessage.Call(uintptr(unsafe.Pointer(m)))
-		}
+func nativeLoop() {
+	for doNativeTick() {
 	}
+}
+
+func nativeEnd() {
+}
+
+func nativeStart() {
+	go func() {
+		for doNativeTick() {
+		}
+	}()
+}
+
+func doNativeTick() bool {
+	ret, _, err := pGetMessage.Call(uintptr(unsafe.Pointer(m)), 0, 0, 0)
+
+	// If the function retrieves a message other than WM_QUIT, the return value is nonzero.
+	// If the function retrieves the WM_QUIT message, the return value is zero.
+	// If there is an error, the return value is -1
+	// https://msdn.microsoft.com/en-us/library/windows/desktop/ms644936(v=vs.85).aspx
+	switch int32(ret) {
+	case -1:
+		log.Printf("systray error: message loop failure: %s\n", err)
+		return false
+	case 0:
+		return false
+	default:
+		pTranslateMessage.Call(uintptr(unsafe.Pointer(m)))
+		pDispatchMessage.Call(uintptr(unsafe.Pointer(m)))
+	}
+	return true
 }
 
 func quit() {
@@ -884,6 +1016,16 @@ func quit() {
 		0,
 		0,
 	)
+
+	wt.muNID.Lock()
+	if wt.nid != nil {
+		wt.nid.delete()
+	}
+	wt.muNID.Unlock()
+	runSystrayExit()
+}
+
+func setInternalLoop(bool) {
 }
 
 func iconBytesToFilePath(iconBytes []byte) (string, error) {
@@ -905,13 +1047,23 @@ func iconBytesToFilePath(iconBytes []byte) (string, error) {
 func SetIcon(iconBytes []byte) {
 	iconFilePath, err := iconBytesToFilePath(iconBytes)
 	if err != nil {
-		log.Errorf("Unable to write icon data to temp file: %v", err)
+		log.Printf("systray error: unable to write icon data to temp file: %s\n", err)
 		return
 	}
 	if err := wt.setIcon(iconFilePath); err != nil {
-		log.Errorf("Unable to set icon: %v", err)
+		log.Printf("systray error: unable to set icon: %s\n", err)
 		return
 	}
+}
+
+// SetIconFromFilePath sets the systray icon from a file path.
+// iconFilePath should be the path to a .ico for windows and .ico/.jpg/.png for other platforms.
+func SetIconFromFilePath(iconFilePath string) error {
+	err := wt.setIcon(iconFilePath)
+	if err != nil {
+		return fmt.Errorf("failed to set icon: %v", err)
+	}
+	return nil
 }
 
 // SetTemplateIcon sets the systray icon as a template icon (on macOS), falling back
@@ -939,20 +1091,28 @@ func (item *MenuItem) parentId() uint32 {
 func (item *MenuItem) SetIcon(iconBytes []byte) {
 	iconFilePath, err := iconBytesToFilePath(iconBytes)
 	if err != nil {
-		log.Errorf("Unable to write icon data to temp file: %v", err)
+		log.Printf("systray error: unable to write icon data to temp file: %s\n", err)
 		return
 	}
 
+	err = item.SetIconFromFilePath(iconFilePath)
+	if err != nil {
+		log.Printf("systray error: %s\n", err)
+		return
+	}
+}
+
+// SetIconFromFilePath sets the icon of a menu item from a file path.
+// iconFilePath should be the path to a .ico for windows and .ico/.jpg/.png for other platforms.
+func (item *MenuItem) SetIconFromFilePath(iconFilePath string) error {
 	h, err := wt.loadIconFrom(iconFilePath)
 	if err != nil {
-		log.Errorf("Unable to load icon from temp file: %v", err)
-		return
+		return fmt.Errorf("unable to load icon from file: %s", err)
 	}
 
-	h, err = wt.iconToBitmap(h)
+	h, err = iconToBitmap(h)
 	if err != nil {
-		log.Errorf("Unable to convert icon to bitmap: %v", err)
-		return
+		return fmt.Errorf("unable to convert icon to bitmap: %s", err)
 	}
 	wt.muMenuItemIcons.Lock()
 	wt.menuItemIcons[uint32(item.id)] = h
@@ -960,29 +1120,24 @@ func (item *MenuItem) SetIcon(iconBytes []byte) {
 
 	err = wt.addOrUpdateMenuItem(uint32(item.id), item.parentId(), item.title, item.disabled, item.checked)
 	if err != nil {
-		log.Errorf("Unable to addOrUpdateMenuItem: %v", err)
-		return
+		return fmt.Errorf("unable to addOrUpdateMenuItem: %s", err)
 	}
+	return nil
 }
 
 // SetTooltip sets the systray tooltip to display on mouse hover of the tray icon,
 // only available on Mac and Windows.
 func SetTooltip(tooltip string) {
 	if err := wt.setTooltip(tooltip); err != nil {
-		log.Errorf("Unable to set tooltip: %v", err)
+		log.Printf("systray error: unable to set tooltip: %s\n", err)
 		return
 	}
-}
-
-// SetRemovalAllowed sets whether a user can remove the systray icon or not.
-// This is only supported on macOS.
-func SetRemovalAllowed(allowed bool) {
 }
 
 func addOrUpdateMenuItem(item *MenuItem) {
 	err := wt.addOrUpdateMenuItem(uint32(item.id), item.parentId(), item.title, item.disabled, item.checked)
 	if err != nil {
-		log.Errorf("Unable to addOrUpdateMenuItem: %v", err)
+		log.Printf("systray error: unable to addOrUpdateMenuItem: %s\n", err)
 		return
 	}
 }
@@ -995,10 +1150,10 @@ func (item *MenuItem) SetTemplateIcon(templateIconBytes []byte, regularIconBytes
 	item.SetIcon(regularIconBytes)
 }
 
-func addSeparator(id uint32) {
-	err := wt.addSeparatorMenuItem(id, 0)
+func addSeparator(id uint32, parent uint32) {
+	err := wt.addSeparatorMenuItem(id, parent)
 	if err != nil {
-		log.Errorf("Unable to addSeparator: %v", err)
+		log.Printf("systray error: unable to addSeparator: %s\n", err)
 		return
 	}
 }
@@ -1006,7 +1161,15 @@ func addSeparator(id uint32) {
 func hideMenuItem(item *MenuItem) {
 	err := wt.hideMenuItem(uint32(item.id), item.parentId())
 	if err != nil {
-		log.Errorf("Unable to hideMenuItem: %v", err)
+		log.Printf("systray error: unable to hideMenuItem: %s\n", err)
+		return
+	}
+}
+
+func removeMenuItem(item *MenuItem) {
+	err := wt.removeMenuItem(uint32(item.id), item.parentId())
+	if err != nil {
+		log.Printf("systray error: unable to removeMenuItem: %s\n", err)
 		return
 	}
 }
@@ -1015,12 +1178,21 @@ func showMenuItem(item *MenuItem) {
 	addOrUpdateMenuItem(item)
 }
 
+func resetMenu() {
+	_, _, _ = pDestroyMenu.Call(uintptr(wt.menus[0]))
+	wt.visibleItems = make(map[uint32][]uint32)
+	wt.menus = make(map[uint32]windows.Handle)
+	wt.menuOf = make(map[uint32]windows.Handle)
+	wt.menuItemIcons = make(map[uint32]windows.Handle)
+	wt.createMenu()
+}
+
 // ShowMessage shows a notification on the end user's desktop
 func ShowMessage(appName, title, msg string) {
 	_ = appName
 	err := wt.showMessage(title, msg)
 	if err != nil {
-		log.Errorf("Unable to show message: %v", err)
+		log.Printf("systray error: unable to show message: %v\n", err)
 		return
 	}
 }
